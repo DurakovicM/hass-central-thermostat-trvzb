@@ -1,0 +1,175 @@
+blueprint:
+  name: Central thermostat for Sonoff TRVZB (ZHA)
+  description: >-
+    Uses one central thermostat (e.g. a Generic thermostat helper) to control
+    any number of Sonoff TRVZB radiator thermostats connected via ZHA.
+
+
+    * The target temperature of the central thermostat is copied to every
+      selected TRV. The TRVs' mode is never changed - each TRV opens and
+      closes its valve by itself.
+
+    * The room temperature sensor is written to each TRV's
+      "External temperature sensor value" entity, on every change and
+      periodically, and each TRV's "External temperature sensor" switch is
+      kept on.
+
+
+    The external temperature entities are found automatically from each
+    TRV's device - you only select the TRV climate entities.
+  domain: automation
+  source_url: https://github.com/DurakovicM/hass-central-thermostat-trvzb/blob/main/central_thermostat_trvzb.yaml
+  homeassistant:
+    min_version: 2024.10.0
+  input:
+    central_thermostat:
+      name: Central thermostat
+      description: The thermostat you control (e.g. a Generic thermostat helper).
+      selector:
+        entity:
+          filter:
+            - domain: climate
+    trvs:
+      name: Radiator thermostats
+      description: The Sonoff TRVZB climate entities to control.
+      selector:
+        entity:
+          multiple: true
+          filter:
+            - domain: climate
+              integration: zha
+    room_sensor:
+      name: Room temperature sensor
+      description: The external sensor measuring the room temperature.
+      selector:
+        entity:
+          filter:
+            - domain: sensor
+              device_class: temperature
+    refresh_interval:
+      name: Refresh interval
+      description: >-
+        How often the room temperature is re-sent to the TRVs even when it has
+        not changed. Keeps the TRVs from falling back to their internal sensor.
+      default: "/15"
+      selector:
+        select:
+          options:
+            - label: Every 5 minutes
+              value: "/5"
+            - label: Every 10 minutes
+              value: "/10"
+            - label: Every 15 minutes
+              value: "/15"
+            - label: Every 30 minutes
+              value: "/30"
+
+mode: queued
+max: 10
+
+triggers:
+  - trigger: state
+    entity_id: !input central_thermostat
+    attribute: temperature
+    id: target
+  - trigger: state
+    entity_id: !input room_sensor
+    id: room
+  - trigger: time_pattern
+    minutes: !input refresh_interval
+    id: periodic
+  - trigger: homeassistant
+    event: start
+    id: start
+  - trigger: event
+    event_type: automation_reloaded
+    id: start
+
+variables:
+  central: !input central_thermostat
+  trvs: !input trvs
+  room_sensor: !input room_sensor
+  # TRVs that are currently reachable
+  online_trvs: >-
+    {{ trvs | select('has_value') | list }}
+  # Each TRV's "External temperature sensor value" number entity
+  ext_value_entities: >-
+    {% set ns = namespace(found=[]) %}
+    {% for trv in online_trvs %}
+      {% set dev = device_id(trv) %}
+      {% if dev %}
+        {% for e in device_entities(dev) %}
+          {% set name = (state_attr(e, 'friendly_name') or '') | lower %}
+          {% if e.startswith('number.') and ('external_temperature' in e or 'external temperature' in name) %}
+            {% set ns.found = ns.found + [e] %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.found }}
+  # Each TRV's "External temperature sensor" enable switch
+  ext_switch_entities: >-
+    {% set ns = namespace(found=[]) %}
+    {% for trv in online_trvs %}
+      {% set dev = device_id(trv) %}
+      {% if dev %}
+        {% for e in device_entities(dev) %}
+          {% set name = (state_attr(e, 'friendly_name') or '') | lower %}
+          {% if e.startswith('switch.') and ('external_temperature' in e or 'external temperature' in name) %}
+            {% set ns.found = ns.found + [e] %}
+          {% endif %}
+        {% endfor %}
+      {% endif %}
+    {% endfor %}
+    {{ ns.found }}
+  central_target: "{{ state_attr(central, 'temperature') }}"
+  room_temp: "{{ states(room_sensor) }}"
+
+actions:
+  # Copy the target temperature from the central thermostat.
+  # The TRVs' mode is never changed - they regulate the valve themselves.
+  - if:
+      - condition: trigger
+        id: [target, start]
+    then:
+      - if:
+          - "{{ central_target | is_number }}"
+        then:
+          - repeat:
+              for_each: "{{ online_trvs }}"
+              sequence:
+                - if:
+                    - "{{ state_attr(repeat.item, 'temperature') | float(-1) != central_target | float }}"
+                  then:
+                    - action: climate.set_temperature
+                      continue_on_error: true
+                      target:
+                        entity_id: "{{ repeat.item }}"
+                      data:
+                        temperature: "{{ central_target | float }}"
+
+  # Feed the room temperature into each TRV's external sensor
+  - if:
+      - condition: trigger
+        id: [room, periodic, start]
+      - "{{ room_temp | is_number }}"
+    then:
+      - repeat:
+          for_each: "{{ ext_switch_entities }}"
+          sequence:
+            - if:
+                - "{{ is_state(repeat.item, 'off') }}"
+              then:
+                - action: switch.turn_on
+                  continue_on_error: true
+                  target:
+                    entity_id: "{{ repeat.item }}"
+      - repeat:
+          for_each: "{{ ext_value_entities }}"
+          sequence:
+            - action: number.set_value
+              continue_on_error: true
+              target:
+                entity_id: "{{ repeat.item }}"
+              data:
+                value: "{{ [[room_temp | float, 0.0] | max, 99.9] | min | round(1) }}"
